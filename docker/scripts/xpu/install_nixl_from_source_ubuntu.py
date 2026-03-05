@@ -50,6 +50,23 @@ def is_pip_package_installed(package_name):
     return result.returncode == 0
 
 
+def get_pip_package_version(package_name):
+    """Returns installed package version, or None if not installed."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "show", package_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        if line.startswith("Version:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
 def find_nixl_wheel_in_cache(cache_dir):
     """Finds a nixl wheel file in the specified cache directory."""
     # The repaired wheel will have a 'manylinux' tag, but this glob still works.
@@ -132,99 +149,75 @@ def build_and_install_prerequisites(args):
     install_system_dependencies()
     ucx_install_path = os.path.abspath(UCX_INSTALL_DIR)
 
-    # -- Step 1: Build UCX from source --
-    print("\n[1/3] Configuring and building UCX from source...", flush=True)
-    if not os.path.exists(UCX_DIR):
-        run_command(["git", "clone", UCX_REPO_URL, UCX_DIR])
-    ucx_source_path = os.path.abspath(UCX_DIR)
+    print("\n[1/2] Configuring and building UCX from source...", flush=True)
+    ucx_version = os.environ.get("UCX_VERSION", "master")
+    build_env = os.environ.copy()
+    build_env["PKG_CONFIG_PATH"] = (
+        f"{ucx_install_path}/lib/pkgconfig:{build_env.get('PKG_CONFIG_PATH', '')}".strip(":")
+    )
+    build_env["LD_LIBRARY_PATH"] = (
+        f"{ucx_install_path}/lib:{build_env.get('LD_LIBRARY_PATH', '')}".strip(":")
+    )
 
-    run_command(["git", "checkout", "master"], cwd=ucx_source_path)
-    run_command(["./autogen.sh"], cwd=ucx_source_path)
-    configure_command = [
-        "./configure",
-        f"--prefix={ucx_install_path}",
-        "--with-verbs",
-        "--enable-mt",
-        "--with-ze=yes",
-        "--enable-examples",
-        "--with-mlx5=no",
-    ]
-    run_command(configure_command, cwd=ucx_source_path)
+    run_command(["git", "clone", UCX_REPO_URL, UCX_DIR])
+    run_command(["git", "checkout", ucx_version], cwd=UCX_DIR)
+    run_command(["./autogen.sh"], cwd=UCX_DIR)
     run_command(
         [
-            "make",
-            "CFLAGS=-Wno-error=incompatible-pointer-types",
-            "-j",
-            str(os.cpu_count() or 1),
+            "./configure",
+            f"--prefix={ucx_install_path}",
+            "--with-ze=yes",
+            "--enable-examples",
+            "--enable-mt",
         ],
-        cwd=ucx_source_path,
+        cwd=UCX_DIR,
+        env=build_env,
     )
-    run_command(["make", "install"], cwd=ucx_source_path)
-    run_command(["ldconfig"])
+    run_command(
+        ["make", "CFLAGS=-Wno-error=incompatible-pointer-types", "-j8"],
+        cwd=UCX_DIR,
+        env=build_env,
+    )
+    run_command(["make", "install"], cwd=UCX_DIR, env=build_env)
     print("--- UCX build and install complete ---", flush=True)
 
-    # -- Step 2: Build and install NIXL from source --
     print("\n[2/2] Building and installing NIXL from source...", flush=True)
-    if not os.path.exists(NIXL_DIR):
-        run_command(["git", "clone", NIXL_REPO_URL, NIXL_DIR])
-    else:
-        run_command(["git", "fetch", "--tags"], cwd=NIXL_DIR)
+    run_command(["git", "clone", NIXL_REPO_URL, NIXL_DIR])
     run_command(["git", "checkout", NIXL_VERSION], cwd=NIXL_DIR)
-    print(f"--> Checked out NIXL version: {NIXL_VERSION}", flush=True)
-
-    lib_nixl_root = os.environ.get("LIBNIXL_ROOT", os.path.join("/tmp", "nixl_install"))
-    build_env = os.environ.copy()
-    build_env["PKG_CONFIG_PATH"] = os.path.join(ucx_install_path, "lib", "pkgconfig")
-    build_env["LIBNIXL_ROOT"] = lib_nixl_root
 
     run_command(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "meson",
-            "pybind11",
-            "patchelf",
-            "uv",
-        ],
-        cwd=os.path.abspath(NIXL_DIR),
+        [sys.executable, "-m", "pip", "install", "--upgrade", "meson", "pybind11", "patchelf"],
         env=build_env,
     )
     run_command(
         [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
-        cwd=os.path.abspath(NIXL_DIR),
+        cwd=NIXL_DIR,
         env=build_env,
     )
     run_command(
-        [
-            "meson",
-            "setup",
-            "--wipe",
-            f"--prefix={lib_nixl_root}",
-            "--buildtype=release",
-            "-Ddisable_gds_backend=true",
-            f"-Ducx_path={ucx_install_path}",
-            "builddir",
-            ".",
-        ],
-        cwd=os.path.abspath(NIXL_DIR),
+        [sys.executable, "-m", "pip", "install", "--no-deps", "."],
+        cwd=NIXL_DIR,
         env=build_env,
     )
-    run_command(["ninja", "-C", "builddir"], cwd=os.path.abspath(NIXL_DIR), env=build_env)
-    run_command(["ninja", "-C", "builddir", "install"], cwd=os.path.abspath(NIXL_DIR), env=build_env)
-    run_command(["ldconfig"])
-    run_command([sys.executable, "-m", "pip", "install", "."], cwd=os.path.abspath(NIXL_DIR), env=build_env)
 
-    meta_dir = os.path.join(NIXL_DIR, "builddir", "src", "bindings", "python", "nixl-meta")
-    run_command(["uv", "build", "--wheel", "--out-dir", meta_dir, meta_dir], cwd=meta_dir)
-    meta_wheels = glob.glob(os.path.join(meta_dir, "nixl-*.whl"))
-    if meta_wheels:
-        meta_wheels.sort()
-        run_command([sys.executable, "-m", "pip", "install", meta_wheels[-1]])
-    else:
-        print("WARNING: nixl meta wheel not found; import nixl may fail.", flush=True)
+    # Enforce meta package version to match NIXL_VERSION without overriding
+    # the locally built nixl-cu12 package.
+    meta_version = get_pip_package_version("nixl")
+    if meta_version != NIXL_VERSION:
+        run_command(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                f"nixl=={NIXL_VERSION}",
+            ],
+            env=build_env,
+        )
+
+    run_command(["rm", "-rf", UCX_DIR, NIXL_DIR])
     print("--- NIXL installation complete ---", flush=True)
 
 
