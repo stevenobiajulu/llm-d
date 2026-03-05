@@ -126,7 +126,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     automake \
     libtool \
     libtool-bin \
-    pkg-config
+    pkg-config && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN if [ -x /usr/sbin/rdma ] && [ ! -e /usr/bin/rdma ]; then ln -s /usr/sbin/rdma /usr/bin/rdma; fi
 
