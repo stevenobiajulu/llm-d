@@ -64,6 +64,10 @@ def find_nixl_wheel_in_cache(cache_dir):
 
 def install_system_dependencies():
     """Installs required system packages using apt-get if run as root."""
+    if os.environ.get("SKIP_SYSTEM_DEPS", "0") == "1":
+        print("--- SKIP_SYSTEM_DEPS=1, skipping system dependency installation. ---", flush=True)
+        return
+
     if os.geteuid() != 0:
         print("\n---", flush=True)
         print(
@@ -76,8 +80,8 @@ def install_system_dependencies():
             flush=True,
         )
         print(
-            "  patchelf build-essential git cmake ninja-build \
-            autotools-dev automake meson libtool libtool-bin",
+            "  patchelf build-essential git ninja-build \
+            autotools-dev automake libtool libtool-bin pkg-config",
             flush=True,
         )
         print("---\n", flush=True)
@@ -85,16 +89,15 @@ def install_system_dependencies():
 
     print("--- Running as root. Installing system dependencies... ---", flush=True)
     apt_packages = [
-        "patchelf",  # <-- Add patchelf here
+        "patchelf",
         "build-essential",
         "git",
-        "cmake",
         "ninja-build",
         "autotools-dev",
         "automake",
-        "meson",
         "libtool",
         "libtool-bin",
+        "pkg-config",
     ]
     run_command(["apt-get", "update"])
     run_command(["apt-get", "install", "-y"] + apt_packages)
@@ -102,7 +105,7 @@ def install_system_dependencies():
 
 
 def build_and_install_prerequisites(args):
-    """Builds UCX and NIXL from source, creating a self-contained wheel."""
+    """Builds UCX and NIXL from source."""
 
     if not args.force_reinstall and is_pip_package_installed("nixl"):
         print("--> NIXL is already installed. Nothing to do.", flush=True)
@@ -126,12 +129,8 @@ def build_and_install_prerequisites(args):
             Starting full build process...",
         flush=True,
     )
-    print("\n--> Installing auditwheel...", flush=True)
-    run_command([sys.executable, "-m", "pip", "install", "auditwheel"])
     install_system_dependencies()
     ucx_install_path = os.path.abspath(UCX_INSTALL_DIR)
-    print(f"--> Using wheel cache directory: {WHEELS_CACHE_HOME}", flush=True)
-    os.makedirs(WHEELS_CACHE_HOME, exist_ok=True)
 
     # -- Step 1: Build UCX from source --
     print("\n[1/3] Configuring and building UCX from source...", flush=True)
@@ -139,28 +138,33 @@ def build_and_install_prerequisites(args):
         run_command(["git", "clone", UCX_REPO_URL, UCX_DIR])
     ucx_source_path = os.path.abspath(UCX_DIR)
 
-    run_command(["git", "checkout", "v1.19.x"], cwd=ucx_source_path)
+    run_command(["git", "checkout", "master"], cwd=ucx_source_path)
     run_command(["./autogen.sh"], cwd=ucx_source_path)
     configure_command = [
         "./configure",
         f"--prefix={ucx_install_path}",
-        "--enable-shared",
-        "--disable-static",
-        "--disable-doxygen-doc",
-        "--enable-optimizations",
-        "--enable-cma",
-        "--enable-devel-headers",
         "--with-verbs",
         "--enable-mt",
-        "--with-ze=no",
+        "--with-ze=yes",
+        "--enable-examples",
+        "--with-mlx5=no",
     ]
     run_command(configure_command, cwd=ucx_source_path)
-    run_command(["make", "-j", str(os.cpu_count() or 1)], cwd=ucx_source_path)
+    run_command(
+        [
+            "make",
+            "CFLAGS=-Wno-error=incompatible-pointer-types",
+            "-j",
+            str(os.cpu_count() or 1),
+        ],
+        cwd=ucx_source_path,
+    )
     run_command(["make", "install"], cwd=ucx_source_path)
+    run_command(["ldconfig"])
     print("--- UCX build and install complete ---", flush=True)
 
-    # -- Step 2: Build NIXL wheel from source --
-    print("\n[2/3] Building NIXL wheel from source...", flush=True)
+    # -- Step 2: Build and install NIXL from source --
+    print("\n[2/2] Building and installing NIXL from source...", flush=True)
     if not os.path.exists(NIXL_DIR):
         run_command(["git", "clone", NIXL_REPO_URL, NIXL_DIR])
     else:
@@ -168,75 +172,59 @@ def build_and_install_prerequisites(args):
     run_command(["git", "checkout", NIXL_VERSION], cwd=NIXL_DIR)
     print(f"--> Checked out NIXL version: {NIXL_VERSION}", flush=True)
 
+    lib_nixl_root = os.environ.get("LIBNIXL_ROOT", os.path.join("/tmp", "nixl_install"))
     build_env = os.environ.copy()
     build_env["PKG_CONFIG_PATH"] = os.path.join(ucx_install_path, "lib", "pkgconfig")
-    ucx_lib_path = os.path.join(ucx_install_path, "lib")
-    ucx_plugin_path = os.path.join(ucx_lib_path, "ucx")
-    existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    build_env["LD_LIBRARY_PATH"] = (
-        f"{ucx_lib_path}:{ucx_plugin_path}:{existing_ld_path}".strip(":")
-    )
-    build_env["LDFLAGS"] = "-Wl,-rpath,$ORIGIN"
-    print(f"--> Using LD_LIBRARY_PATH: {build_env['LD_LIBRARY_PATH']}", flush=True)
+    build_env["LIBNIXL_ROOT"] = lib_nixl_root
 
-    temp_wheel_dir = os.path.join(ROOT_DIR, "temp_wheelhouse")
     run_command(
         [
             sys.executable,
             "-m",
             "pip",
-            "wheel",
-            ".",
-            "--no-deps",
-            f"--wheel-dir={temp_wheel_dir}",
+            "install",
+            "--upgrade",
+            "meson",
+            "pybind11",
+            "patchelf",
+            "uv",
         ],
         cwd=os.path.abspath(NIXL_DIR),
         env=build_env,
     )
-
-    # -- Step 3: Repair the wheel by copying UCX libraries --
-    print("\n[3/3] Repairing NIXL wheel to include UCX libraries...", flush=True)
-    unrepaired_wheel = find_nixl_wheel_in_cache(temp_wheel_dir)
-    if not unrepaired_wheel:
-        raise RuntimeError("Failed to find the NIXL wheel after building it.")
-
-    # We tell auditwheel to ignore the plugin that mesonpy already handled.
-    auditwheel_command = [
-        "auditwheel",
-        "repair",
-        "--exclude",
-        "libplugin_UCX.so",  # <-- Exclude because mesonpy already includes it
-        unrepaired_wheel,
-        f"--wheel-dir={WHEELS_CACHE_HOME}",
-    ]
-    run_command(auditwheel_command, env=build_env)
-
-    # --- CLEANUP ---
-    # No more temporary files to remove, just the temp wheelhouse
-    run_command(["rm", "-rf", temp_wheel_dir])
-    # --- END CLEANUP ---
-
-    newly_built_wheel = find_nixl_wheel_in_cache(WHEELS_CACHE_HOME)
-    if not newly_built_wheel:
-        raise RuntimeError("Failed to find the repaired NIXL wheel.")
-
-    print(
-        f"--> Successfully built self-contained wheel: \
-            {os.path.basename(newly_built_wheel)}. Now installing...",
-        flush=True,
+    run_command(
+        [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+        cwd=os.path.abspath(NIXL_DIR),
+        env=build_env,
     )
-    install_command = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-deps",  # w/o "no-deps", it will install cuda-torch
-        newly_built_wheel,
-    ]
-    if args.force_reinstall:
-        install_command.insert(-1, "--force-reinstall")
+    run_command(
+        [
+            "meson",
+            "setup",
+            "--wipe",
+            f"--prefix={lib_nixl_root}",
+            "--buildtype=release",
+            "-Ddisable_gds_backend=true",
+            f"-Ducx_path={ucx_install_path}",
+            "builddir",
+            ".",
+        ],
+        cwd=os.path.abspath(NIXL_DIR),
+        env=build_env,
+    )
+    run_command(["ninja", "-C", "builddir"], cwd=os.path.abspath(NIXL_DIR), env=build_env)
+    run_command(["ninja", "-C", "builddir", "install"], cwd=os.path.abspath(NIXL_DIR), env=build_env)
+    run_command(["ldconfig"])
+    run_command([sys.executable, "-m", "pip", "install", "."], cwd=os.path.abspath(NIXL_DIR), env=build_env)
 
-    run_command(install_command)
+    meta_dir = os.path.join(NIXL_DIR, "builddir", "src", "bindings", "python", "nixl-meta")
+    run_command(["uv", "build", "--wheel", "--out-dir", meta_dir, meta_dir], cwd=meta_dir)
+    meta_wheels = glob.glob(os.path.join(meta_dir, "nixl-*.whl"))
+    if meta_wheels:
+        meta_wheels.sort()
+        run_command([sys.executable, "-m", "pip", "install", meta_wheels[-1]])
+    else:
+        print("WARNING: nixl meta wheel not found; import nixl may fail.", flush=True)
     print("--- NIXL installation complete ---", flush=True)
 
 

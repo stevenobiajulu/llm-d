@@ -1,4 +1,4 @@
-ARG ONEAPI_VERSION=2025.2.2-0
+ARG ONEAPI_VERSION=2025.3.2-0
 
 # vLLM build settings - defaults should match docker/vllm-version file
 # Override here for platform-specific testing or via build args
@@ -100,13 +100,44 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # install development dependencies (for testing)
 RUN python3 -m pip install -e tests/vllm_test_utils
 
+# install RDMA userspace components
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    iproute2 \
+    rdma-core \
+    libibverbs-dev \
+    ibverbs-utils \
+    libibverbs1 \
+    ibverbs-providers \
+    librdmacm-dev \
+    librdmacm1 \
+    libibumad-dev \
+    libibumad3 \
+    libibmad-dev \
+    libibmad5 \
+    infiniband-diags \
+    perftest \
+    ibutils \
+    libmlx5-1 \
+    libmlx4-1 \
+    patchelf \
+    build-essential \
+    ninja-build \
+    autotools-dev \
+    automake \
+    libtool \
+    libtool-bin \
+    pkg-config
+
+RUN if [ -x /usr/sbin/rdma ] && [ ! -e /usr/bin/rdma ]; then ln -s /usr/sbin/rdma /usr/bin/rdma; fi
+
 # install nixl from source code using a compatible version
 COPY docker/scripts/xpu/install_nixl_from_source_ubuntu.py /tmp/install_nixl_from_source_ubuntu.py
 # Pin NIXL_VERSION for reproducible builds and to ensure compatibility with the current
 # vLLM XPU runtime; the installer script can fetch the latest version if this is unset,
 # but we intentionally use a fixed, tested version here.
-ENV NIXL_VERSION=0.7.0
-RUN python3 /tmp/install_nixl_from_source_ubuntu.py
+ENV NIXL_VERSION=0.9.0
+ENV SKIP_SYSTEM_DEPS=1
+RUN python3 /tmp/install_nixl_from_source_ubuntu.py --force-reinstall
 
 # PyJWT-2.7.0 will influence some wheel behaviors, remove its dist-info to avoid conflicts
 RUN rm /usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/ -rf
