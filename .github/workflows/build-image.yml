@@ -125,9 +125,7 @@ jobs:
             rocm:
               - 'docker/Dockerfile.rocm'
             xpu:
-              - 'docker/Dockerfile.xpu'
               - 'docker/vllm-version'
-              - 'docker/scripts/xpu/**'
             cpu:
               - 'docker/Dockerfile.cpu'
               - 'docker/vllm-version'
@@ -1097,19 +1095,24 @@ jobs:
         run: |
           echo "cache_buster_timestamp=$(date)" >> $GITHUB_OUTPUT
 
+      - name: Checkout vLLM source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.vllm_repo || steps.vllm-version.outputs.repo }}
+          ref: ${{ inputs.vllm_commit_sha || steps.vllm-version.outputs.commit_sha }}
+          path: .cache/vllm-src
+
       - name: Build and push the image
         id: build-and-push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./docker/Dockerfile.xpu
+          context: ./.cache/vllm-src
+          file: ./.cache/vllm-src/docker/Dockerfile.xpu
           platforms: linux/amd64
           push: true
           provenance: true
           build-args: |
             CACHE_BUSTER=${{ steps.cache_buster_timestamp.outputs.cache_buster_timestamp }}
-            VLLM_REPO=${{ inputs.vllm_repo || steps.vllm-version.outputs.repo }}
-            VLLM_COMMIT_SHA=${{ inputs.vllm_commit_sha || steps.vllm-version.outputs.commit_sha }}
           # disabling cache from cache to temporarily to prevent building issues
           # cache-from: type=gha,scope=xpu-dev
           # cache-to: type=gha,mode=max,scope=xpu-dev,oci-mediatypes=true,compression=zstd
